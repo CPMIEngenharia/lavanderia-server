@@ -14,7 +14,7 @@ const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN 
 const mpPayment = new Payment(client);
 const mpPreference = new Preference(client);
 
-// URL do seu servidor (o Render preenche automaticamente ou usamos fixo)
+// URL do Servidor
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL || `https://${process.env.RENDER_SERVICE_NAME}.onrender.com`;
 
 // --- MQTT (HiveMQ) ---
@@ -42,13 +42,10 @@ async function buscarPrecoPorTempo(tempoDesejado) {
         const response = await axios.get(url);
         const linhas = response.data.split('\n');
 
-        // Percorre a planilha (Valor | Tempo | Ciclo)
         for (let i = 0; i < linhas.length; i++) {
             const colunas = linhas[i].split(',');
             if (colunas.length >= 3) {
-                // Coluna B é o Tempo
                 const tempoPlanilha = parseInt(colunas[1].trim());
-                
                 if (tempoPlanilha == tempoDesejado) {
                     const precoString = colunas[0].replace('R$', '').replace(' ', '').trim();
                     return {
@@ -65,46 +62,39 @@ async function buscarPrecoPorTempo(tempoDesejado) {
     }
 }
 
-// --- ROTA 1: CRIAR PAGAMENTO (O Cliente acessa via QR Code da Máquina) ---
-// Exemplo de link: https://seu-servidor.onrender.com/comprar/maquina01/15
+// --- ROTA DE COMPRA (Dinâmica para qualquer máquina) ---
+// Exemplo: /comprar/lavadora01/15 ou /comprar/secadora04/45
 app.get('/comprar/:maquinaid/:tempo', async (req, res) => {
     const { maquinaid, tempo } = req.params;
 
-    // 1. Busca o preço na planilha para esse tempo
     const dados = await buscarPrecoPorTempo(tempo);
-
-    if (!dados) {
-        return res.send(`<h1>Erro</h1><p>Tempo de ${tempo} min não encontrado na tabela de preços.</p>`);
-    }
+    if (!dados) return res.send(`<h1>Erro</h1><p>Tempo ${tempo} min não cadastrado.</p>`);
 
     console.log(`[NOVO PEDIDO] ${maquinaid} | ${tempo} min | R$ ${dados.preco}`);
 
     try {
-        // 2. Cria a Preferência no Mercado Pago (O Segredo do Sucesso)
         const preferenceData = {
             items: [
                 {
-                    id: `lavagem-${tempo}`,
-                    title: `Lavanderia: Ciclo ${dados.ciclo} (${tempo} min)`,
+                    id: `ciclo-${tempo}`,
+                    title: `Ciclo ${dados.ciclo} (${tempo} min) - ${maquinaid.toUpperCase()}`,
                     quantity: 1,
                     currency_id: 'BRL',
                     unit_price: dados.preco
                 }
             ],
-            // AQUI ESTÁ A MÁGICA: Guardamos o comando na "external_reference"
+            // REFERÊNCIA EXTERNA: Guarda quem é a máquina (ex: lavadora01-15)
             external_reference: `${maquinaid}-${tempo}`,
             notification_url: `${SERVER_URL}/webhook`,
             auto_return: 'approved',
             back_urls: {
-                success: 'https://www.google.com', // Pode mudar para uma pagina de "Obrigado"
+                success: 'https://www.google.com', 
                 failure: 'https://www.google.com',
                 pending: 'https://www.google.com'
             }
         };
 
         const preference = await mpPreference.create({ body: preferenceData });
-        
-        // 3. Redireciona o cliente para o Pagamento
         res.redirect(preference.init_point);
 
     } catch (error) {
@@ -113,7 +103,7 @@ app.get('/comprar/:maquinaid/:tempo', async (req, res) => {
     }
 });
 
-// --- ROTA 2: WEBHOOK (Recebe a confirmação) ---
+// --- WEBHOOK (Roteador Central) ---
 app.post('/webhook', async (req, res) => {
     const { action, type, data } = req.body;
     const id = data?.id;
@@ -125,20 +115,22 @@ app.post('/webhook', async (req, res) => {
             const pgto = await mpPayment.get({ id: id });
 
             if (pgto.status === 'approved') {
-                // AQUI LEMOS O CARIMBO QUE CRIAMOS LÁ EM CIMA
-                const referencia = pgto.external_reference; // Ex: maquina01-15
+                const referencia = pgto.external_reference; // Ex: lavadora03-15
                 console.log(`[PAGAMENTO APROVADO] Ref: ${referencia}`);
 
                 if (referencia && referencia.includes('-')) {
-                    const [maquina, tempoString] = referencia.split('-');
+                    // SEPARA O ID DA MÁQUINA DO TEMPO
+                    const [maquinaId, tempoString] = referencia.split('-');
                     const tempo = parseInt(tempoString);
 
-                    // Envia MQTT
-                    const payload = JSON.stringify({ ciclo: "AUTO", tempo: tempo }); // Ciclo AUTO pois o Arduino decide baseado no tempo
+                    // Cria o Tópico Específico: lavanderia/lavadora03/comandos
+                    const topicoAlvo = `lavanderia/${maquinaId}/comandos`;
+                    
+                    const payload = JSON.stringify({ ciclo: "AUTO", tempo: tempo });
                     
                     if (mqttClient.connected) {
-                        mqttClient.publish(process.env.MQTT_TOPIC_COMANDO, payload);
-                        console.log(`[MQTT] Comando enviado: ${payload}`);
+                        mqttClient.publish(topicoAlvo, payload);
+                        console.log(`[MQTT] Enviado para [${topicoAlvo}]: ${payload}`);
                     }
                 }
             }
@@ -148,5 +140,5 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.send('<h1>Lavanderia V2 (Modo Preferência)</h1>'));
+app.get('/', (req, res) => res.send('<h1>Sistema Multi-Máquinas Online</h1>'));
 app.listen(PORT, () => console.log(`[START] Porta ${PORT}`));
