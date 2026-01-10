@@ -1,144 +1,175 @@
-require('dotenv').config();
+/*
+ * SERVIDOR LAVANDERIA IOT - VERSÃO MULTI-CLIENTE (V2)
+ * Funcionalidade: Recebe pedidos de várias máquinas e direciona
+ * o pagamento para a conta do Mercado Pago do dono específico.
+ */
+
 const express = require('express');
-const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
+const { MercadoPagoConfig, Payment } = require('mercadopago');
 const mqtt = require('mqtt');
-const axios = require('axios');
+const cors = require('cors');
+const bodyParser = require('body-parser');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(bodyParser.json());
+app.use(cors());
 
-app.use(express.json());
+// --- 1. CONFIGURAÇÃO MQTT (Seu HiveMQ) ---
+const MQTT_URL = "mqtts://d54e131cfd444c24b4775af5044e1a33.s1.eu.hivemq.cloud:8883";
+const MQTT_USER = "servidorlv_nodejs";
+const MQTT_PASS = "Lave2025";
 
-// --- CONFIGURAÇÕES ---
-const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
-const mpPayment = new Payment(client);
-const mpPreference = new Preference(client);
-
-// URL do Servidor
-const SERVER_URL = process.env.RENDER_EXTERNAL_URL || `https://${process.env.RENDER_SERVICE_NAME}.onrender.com`;
-
-// --- MQTT (HiveMQ) ---
-console.log('[SISTEMA] Conectando ao MQTT HiveMQ...');
-let host = process.env.MQTT_HOST;
-if (!host.startsWith('mqtts://') && !host.startsWith('mqtt://')) {
-    host = `mqtts://${host}`;
-}
-
-const mqttClient = mqtt.connect(host, {
-    username: process.env.MQTT_USER,
-    password: process.env.MQTT_PASSWORD,
-    port: 8883,
-    protocol: 'mqtts',
-    rejectUnauthorized: false
+const mqttClient = mqtt.connect(MQTT_URL, {
+    username: MQTT_USER,
+    password: MQTT_PASS,
+    rejectUnauthorized: false // Para aceitar o certificado do HiveMQ
 });
 
-mqttClient.on('connect', () => console.log('[MQTT] Conectado com Sucesso!'));
-mqttClient.on('error', (err) => console.error('[MQTT ERRO]', err.message));
+mqttClient.on('connect', () => {
+    console.log("CONECTADO AO MQTT (HIVEMQ)!");
+});
 
-// --- FUNÇÃO: BUSCAR PREÇO POR TEMPO (CSV) ---
-async function buscarPrecoPorTempo(tempoDesejado) {
+// ==================================================================
+// --- 2. CADASTRO DE MÁQUINAS E DONOS (Sua "Agenda") ---
+// ==================================================================
+// Aqui você cola o Access Token que o cliente te mandar no WhatsApp.
+// O ID da máquina (ex: maquina01) deve ser o mesmo que está no código do ESP32.
+
+const CLIENTES = {
+    // [SUA MÁQUINA DE TESTE]
+    "maquina01": "APP-USR-SEU-TOKEN-AQUI", 
+
+    // [CLIENTE JOÃO - LAVADORA]
+    "lavadora01": "APP-USR-TOKEN-DO-JOAO-AQUI",
+
+    // [CLIENTE JOÃO - SECADORA]
+    "secadora01": "APP-USR-TOKEN-DO-JOAO-AQUI", 
+
+    // [CLIENTE MARIA]
+    "lavadora02": "APP-USR-TOKEN-DA-MARIA-AQUI"
+};
+
+// ==================================================================
+
+// --- ROTA 1: GERAR O PIX (Chamada pelo App ou QR Code) ---
+app.post('/criar_pagamento', async (req, res) => {
     try {
-        const url = process.env.SHEETS_URL;
-        const response = await axios.get(url);
-        const linhas = response.data.split('\n');
+        // O Front-end/QR Code deve enviar: { id_maquina: "lavadora01", valor: 10.00, tempo: 45 }
+        const { id_maquina, valor, tempo } = req.body;
 
-        for (let i = 0; i < linhas.length; i++) {
-            const colunas = linhas[i].split(',');
-            if (colunas.length >= 3) {
-                const tempoPlanilha = parseInt(colunas[1].trim());
-                if (tempoPlanilha == tempoDesejado) {
-                    const precoString = colunas[0].replace('R$', '').replace(' ', '').trim();
-                    return {
-                        preco: parseFloat(precoString),
-                        ciclo: colunas[2].trim().replace(/[\r\n]+/g, '')
-                    };
-                }
-            }
+        console.log(`Novo Pedido: Máquina ${id_maquina} - R$ ${valor}`);
+
+        // 1. Busca o Token do Dono
+        const tokenDoDono = CLIENTES[id_maquina];
+
+        if (!tokenDoDono) {
+            return res.status(400).json({ error: "Máquina não cadastrada ou Token inválido." });
         }
-        return null;
-    } catch (e) {
-        console.error('[ERRO CSV]', e.message);
-        return null;
-    }
-}
 
-// --- ROTA DE COMPRA (Dinâmica para qualquer máquina) ---
-// Exemplo: /comprar/lavadora01/15 ou /comprar/secadora04/45
-app.get('/comprar/:maquinaid/:tempo', async (req, res) => {
-    const { maquinaid, tempo } = req.params;
+        // 2. Configura o Mercado Pago com a conta DELE
+        const client = new MercadoPagoConfig({ accessToken: tokenDoDono });
+        const payment = new Payment(client);
 
-    const dados = await buscarPrecoPorTempo(tempo);
-    if (!dados) return res.send(`<h1>Erro</h1><p>Tempo ${tempo} min não cadastrado.</p>`);
-
-    console.log(`[NOVO PEDIDO] ${maquinaid} | ${tempo} min | R$ ${dados.preco}`);
-
-    try {
-        const preferenceData = {
-            items: [
-                {
-                    id: `ciclo-${tempo}`,
-                    title: `Ciclo ${dados.ciclo} (${tempo} min) - ${maquinaid.toUpperCase()}`,
-                    quantity: 1,
-                    currency_id: 'BRL',
-                    unit_price: dados.preco
-                }
-            ],
-            // REFERÊNCIA EXTERNA: Guarda quem é a máquina (ex: lavadora01-15)
-            external_reference: `${maquinaid}-${tempo}`,
-            notification_url: `${SERVER_URL}/webhook`,
-            auto_return: 'approved',
-            back_urls: {
-                success: 'https://www.google.com', 
-                failure: 'https://www.google.com',
-                pending: 'https://www.google.com'
+        // 3. Cria a Preferência de Pagamento
+        const result = await payment.create({
+            body: {
+                transaction_amount: parseFloat(valor),
+                description: `Ciclo Lavanderia - ${id_maquina}`,
+                payment_method_id: 'pix',
+                payer: {
+                    email: 'cliente@email.com' // Pode ser genérico
+                },
+                // O SEGREDO ESTÁ AQUI: "external_reference" guarda os dados para o Webhook
+                // Guardamos o ID da máquina e o tempo (ex: "lavadora01|45")
+                external_reference: `${id_maquina}|${tempo}` 
             }
-        };
+        });
 
-        const preference = await mpPreference.create({ body: preferenceData });
-        res.redirect(preference.init_point);
+        // 4. Devolve o Copia e Cola e o QR Code Base64
+        const qrCode = result.point_of_interaction.transaction_data.qr_code;
+        const qrCodeBase64 = result.point_of_interaction.transaction_data.qr_code_base64;
+        const paymentId = result.id;
+
+        res.json({
+            status: "ok",
+            qr_code: qrCode,
+            qr_base64: qrCodeBase64,
+            payment_id: paymentId
+        });
 
     } catch (error) {
-        console.error('[ERRO PREFERENCE]', error);
-        res.status(500).send('Erro ao gerar pagamento.');
+        console.error("Erro ao gerar Pix:", error);
+        res.status(500).json({ error: "Erro interno ao gerar pagamento" });
     }
 });
 
-// --- WEBHOOK (Roteador Central) ---
+// --- ROTA 2: WEBHOOK (O Mercado Pago avisa aqui quando pagarem) ---
 app.post('/webhook', async (req, res) => {
-    const { action, type, data } = req.body;
-    const id = data?.id;
+    const topic = req.query.topic || req.query.type;
+    const id = req.query.id || req.query['data.id'];
 
-    res.status(200).send('OK');
-
-    if (id && (action === 'payment.created' || action === 'payment.updated' || type === 'payment')) {
+    if (topic === 'payment') {
         try {
-            const pgto = await mpPayment.get({ id: id });
+            console.log(`Pagamento recebido! ID: ${id}`);
+            
+            // Aqui precisamos descobrir de QUEM foi esse pagamento.
+            // O jeito certo seria consultar o pagamento na API para ver o "external_reference".
+            // Mas como não sabemos qual Token usar (pode ser qualquer cliente),
+            // precisamos de uma estratégia.
+            
+            // ESTRATÉGIA SIMPLIFICADA PARA MP ATUAL:
+            // O MP manda o ID. Infelizmente, para consultar o status "approved",
+            // precisamos tentar os tokens até achar (ou salvar o ID no banco na hora da criação).
+            
+            // --- SOLUÇÃO ROBUSTA (CONSULTA EM TODOS OS TOKENS) ---
+            let pagamentoInfo = null;
+            let maquinaAlvo = "";
+            let tempoAlvo = "";
 
-            if (pgto.status === 'approved') {
-                const referencia = pgto.external_reference; // Ex: lavadora03-15
-                console.log(`[PAGAMENTO APROVADO] Ref: ${referencia}`);
-
-                if (referencia && referencia.includes('-')) {
-                    // SEPARA O ID DA MÁQUINA DO TEMPO
-                    const [maquinaId, tempoString] = referencia.split('-');
-                    const tempo = parseInt(tempoString);
-
-                    // Cria o Tópico Específico: lavanderia/lavadora03/comandos
-                    const topicoAlvo = `lavanderia/${maquinaId}/comandos`;
+            // Varre a lista de clientes para achar quem recebeu esse pagamento
+            for (const [keyMaq, token] of Object.entries(CLIENTES)) {
+                try {
+                    const client = new MercadoPagoConfig({ accessToken: token });
+                    const payment = new Payment(client);
+                    const dados = await payment.get({ id: id });
                     
-                    const payload = JSON.stringify({ ciclo: "AUTO", tempo: tempo });
-                    
-                    if (mqttClient.connected) {
-                        mqttClient.publish(topicoAlvo, payload);
-                        console.log(`[MQTT] Enviado para [${topicoAlvo}]: ${payload}`);
+                    if (dados && dados.status === 'approved') {
+                        pagamentoInfo = dados;
+                        console.log(`Pagamento encontrado na conta da máquina: ${keyMaq}`);
+                        break; // Achou! Para de procurar.
                     }
+                } catch (e) {
+                    // Ignora erro (significa que o pagamento não é desse token)
                 }
             }
+
+            if (pagamentoInfo) {
+                // Recupera os dados que escondemos no external_reference
+                // Formato: "lavadora01|45"
+                const ref = pagamentoInfo.external_reference.split('|');
+                maquinaAlvo = ref[0];
+                tempoAlvo = ref[1];
+
+                console.log(`LIBERANDO MÁQUINA: ${maquinaAlvo} por ${tempoAlvo} min`);
+
+                // --- COMANDO MQTT ---
+                const topicoComando = `lavanderia/${maquinaAlvo}/comandos`;
+                const mensagem = JSON.stringify({ tempo: tempoAlvo }); // ex: {"tempo": 45} ou {"tempo": "secar"}
+
+                mqttClient.publish(topicoComando, mensagem);
+                console.log(`Comando enviado para ${topicoComando}`);
+            }
+
         } catch (error) {
-            console.error('[ERRO WEBHOOK]', error);
+            console.error("Erro no Webhook:", error);
         }
     }
+
+    res.status(200).send("OK");
 });
 
-app.get('/', (req, res) => res.send('<h1>Sistema Multi-Máquinas Online</h1>'));
-app.listen(PORT, () => console.log(`[START] Porta ${PORT}`));
+// Inicia o servidor
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+});
