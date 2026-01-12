@@ -1,7 +1,7 @@
 /*
- * SERVIDOR LAVANDERIA IOT - VERSÃO MULTI-CLIENTE (V2)
- * Funcionalidade: Recebe pedidos de várias máquinas e direciona
- * o pagamento para a conta do Mercado Pago do dono específico.
+ * SERVIDOR LAVANDERIA IOT - V4 (AUTONOMIA DO CLIENTE)
+ * - Multi-Cliente: Cada um com sua conta Mercado Pago.
+ * - Multi-Planilha: Cada cliente controla seus próprios preços no seu Google Drive.
  */
 
 const express = require('express');
@@ -9,167 +9,178 @@ const { MercadoPagoConfig, Payment } = require('mercadopago');
 const mqtt = require('mqtt');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const { JWT } = require('google-auth-library');
+const { GoogleSpreadsheet } = require('google-spreadsheet');
+require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.json());
 app.use(cors());
 
-// --- 1. CONFIGURAÇÃO MQTT (Seu HiveMQ) ---
-const MQTT_URL = "mqtts://d54e131cfd444c24b4775af5044e1a33.s1.eu.hivemq.cloud:8883";
-const MQTT_USER = "servidorlv_nodejs";
-const MQTT_PASS = "Lave2025";
-
-const mqttClient = mqtt.connect(MQTT_URL, {
-    username: MQTT_USER,
-    password: MQTT_PASS,
-    rejectUnauthorized: false // Para aceitar o certificado do HiveMQ
-});
-
-mqttClient.on('connect', () => {
-    console.log("CONECTADO AO MQTT (HIVEMQ)!");
+// --- AUTENTICAÇÃO GOOGLE (O Robô que lê as planilhas) ---
+const serviceAccountAuth = new JWT({
+  email: process.env.GOOGLE_SERVICE_EMAIL,
+  key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
 // ==================================================================
-// --- 2. CADASTRO DE MÁQUINAS E DONOS (Sua "Agenda") ---
+// --- 1. CADASTRO DE CLIENTES (AGENDA COMPLETA) ---
 // ==================================================================
-// Aqui você cola o Access Token que o cliente te mandar no WhatsApp.
-// O ID da máquina (ex: maquina01) deve ser o mesmo que está no código do ESP32.
+// Agora guardamos 2 coisas: O Token do Banco e o ID da Planilha DELE.
 
 const CLIENTES = {
-    // [SUA MÁQUINA DE TESTE]
-    "maquina01": "APP-USR-SEU-TOKEN-AQUI", 
+    // MÁQUINA DO PEDRO
+    "lavadora01": {
+        dono: "Pedro",
+        token_mp: "APP-USR-TOKEN-DO-PEDRO",
+        sheet_id: "ID_DA_PLANILHA_DO_PEDRO_1A2B3C" 
+    },
 
-    // [CLIENTE JOÃO - LAVADORA]
-    "lavadora01": "APP-USR-TOKEN-DO-JOAO-AQUI",
-
-    // [CLIENTE JOÃO - SECADORA]
-    "secadora01": "APP-USR-TOKEN-DO-JOAO-AQUI", 
-
-    // [CLIENTE MARIA]
-    "lavadora02": "APP-USR-TOKEN-DA-MARIA-AQUI"
+    // MÁQUINA DO JOÃO (Pode usar a mesma planilha para todas as máquinas dele)
+    "lavadora02": {
+        dono: "João",
+        token_mp: "APP-USR-TOKEN-DO-JOAO",
+        sheet_id: "ID_DA_PLANILHA_DO_JOAO_XYZ123" 
+    },
+    "secadora02": {
+        dono: "João",
+        token_mp: "APP-USR-TOKEN-DO-JOAO",
+        sheet_id: "ID_DA_PLANILHA_DO_JOAO_XYZ123" 
+    }
 };
 
 // ==================================================================
-
-// --- ROTA 1: GERAR O PIX (Chamada pelo App ou QR Code) ---
-app.post('/criar_pagamento', async (req, res) => {
+// --- 2. FUNÇÃO: BUSCAR PREÇO NA PLANILHA DO CLIENTE ---
+// ==================================================================
+async function buscarPrecoDinamico(idMaquina, tipoCiclo) {
     try {
-        // O Front-end/QR Code deve enviar: { id_maquina: "lavadora01", valor: 10.00, tempo: 45 }
-        const { id_maquina, valor, tempo } = req.body;
+        const dadosCliente = CLIENTES[idMaquina];
+        if (!dadosCliente) return null;
 
-        console.log(`Novo Pedido: Máquina ${id_maquina} - R$ ${valor}`);
+        // Carrega a planilha ESPECÍFICA deste cliente
+        const doc = new GoogleSpreadsheet(dadosCliente.sheet_id, serviceAccountAuth);
+        await doc.loadInfo();
+        const sheet = doc.sheetsByIndex[0]; 
+        const rows = await sheet.getRows();
 
-        // 1. Busca o Token do Dono
-        const tokenDoDono = CLIENTES[id_maquina];
-
-        if (!tokenDoDono) {
-            return res.status(400).json({ error: "Máquina não cadastrada ou Token inválido." });
+        // Procura a configuração da máquina (para saber se tem preço específico por máquina)
+        // Se a planilha do João tiver só 1 linha genérica, ele pode chamar de "padrao"
+        // Ou ele pode listar "lavadora02" e colocar o preço.
+        
+        // Tentamos achar a linha com o ID exato da máquina.
+        // Se não achar, tentamos achar uma linha "padrao".
+        let linha = rows.find(row => row.get('id_maquina') === idMaquina);
+        if (!linha) {
+             linha = rows.find(row => row.get('id_maquina') === 'padrao');
         }
 
-        // 2. Configura o Mercado Pago com a conta DELE
-        const client = new MercadoPagoConfig({ accessToken: tokenDoDono });
+        if (!linha) return null; // Não achou preço nem pra máquina nem padrão
+
+        let precoString = "0";
+        if (tipoCiclo == "15") precoString = linha.get('preco_15');
+        else if (tipoCiclo == "45") precoString = linha.get('preco_45');
+        else if (tipoCiclo == "secar") precoString = linha.get('preco_secar');
+
+        return parseFloat(precoString.replace(',', '.'));
+
+    } catch (error) {
+        console.error(`Erro ao ler planilha do cliente ${idMaquina}:`, error);
+        return null; 
+    }
+}
+
+// ==================================================================
+// --- 3. CONFIGURAÇÃO MQTT ---
+// ==================================================================
+const mqttClient = mqtt.connect("mqtts://d54e131cfd444c24b4775af5044e1a33.s1.eu.hivemq.cloud:8883", {
+    username: "servidorlv_nodejs",
+    password: "Lave2025",
+    rejectUnauthorized: false 
+});
+
+// ==================================================================
+// --- 4. ROTA DE PAGAMENTO ---
+// ==================================================================
+app.post('/criar_pagamento', async (req, res) => {
+    try {
+        const { id_maquina, tempo } = req.body;
+        
+        // 1. Identifica o Cliente
+        const dadosCliente = CLIENTES[id_maquina];
+        if (!dadosCliente) return res.status(400).json({ error: "Máquina não cadastrada." });
+
+        console.log(`Pedido para ${dadosCliente.dono} (Maq: ${id_maquina})`);
+
+        // 2. Busca o preço na planilha DELE
+        const valorReal = await buscarPrecoDinamico(id_maquina, tempo);
+        
+        if (!valorReal) return res.status(400).json({ error: "Erro de preço ou planilha inacessível." });
+
+        console.log(`Preço definido pelo ${dadosCliente.dono}: R$ ${valorReal}`);
+
+        // 3. Gera Pix na conta DELE
+        const client = new MercadoPagoConfig({ accessToken: dadosCliente.token_mp });
         const payment = new Payment(client);
 
-        // 3. Cria a Preferência de Pagamento
         const result = await payment.create({
             body: {
-                transaction_amount: parseFloat(valor),
-                description: `Ciclo Lavanderia - ${id_maquina}`,
+                transaction_amount: valorReal,
+                description: `Lavanderia ${dadosCliente.dono} - ${id_maquina}`,
                 payment_method_id: 'pix',
-                payer: {
-                    email: 'cliente@email.com' // Pode ser genérico
-                },
-                // O SEGREDO ESTÁ AQUI: "external_reference" guarda os dados para o Webhook
-                // Guardamos o ID da máquina e o tempo (ex: "lavadora01|45")
-                external_reference: `${id_maquina}|${tempo}` 
+                payer: { email: 'cliente@email.com' },
+                external_reference: `${id_maquina}|${tempo}`
             }
         });
 
-        // 4. Devolve o Copia e Cola e o QR Code Base64
-        const qrCode = result.point_of_interaction.transaction_data.qr_code;
-        const qrCodeBase64 = result.point_of_interaction.transaction_data.qr_code_base64;
-        const paymentId = result.id;
-
         res.json({
             status: "ok",
-            qr_code: qrCode,
-            qr_base64: qrCodeBase64,
-            payment_id: paymentId
+            valor: valorReal, // Retorna o valor pro Front mostrar pro usuário
+            qr_code: result.point_of_interaction.transaction_data.qr_code,
+            qr_base64: result.point_of_interaction.transaction_data.qr_code_base64,
+            payment_id: result.id
         });
 
     } catch (error) {
-        console.error("Erro ao gerar Pix:", error);
-        res.status(500).json({ error: "Erro interno ao gerar pagamento" });
+        console.error("Erro no pagamento:", error);
+        res.status(500).json({ error: "Erro interno" });
     }
 });
 
-// --- ROTA 2: WEBHOOK (O Mercado Pago avisa aqui quando pagarem) ---
+// ==================================================================
+// --- 5. WEBHOOK ---
+// ==================================================================
 app.post('/webhook', async (req, res) => {
     const topic = req.query.topic || req.query.type;
     const id = req.query.id || req.query['data.id'];
 
     if (topic === 'payment') {
-        try {
-            console.log(`Pagamento recebido! ID: ${id}`);
-            
-            // Aqui precisamos descobrir de QUEM foi esse pagamento.
-            // O jeito certo seria consultar o pagamento na API para ver o "external_reference".
-            // Mas como não sabemos qual Token usar (pode ser qualquer cliente),
-            // precisamos de uma estratégia.
-            
-            // ESTRATÉGIA SIMPLIFICADA PARA MP ATUAL:
-            // O MP manda o ID. Infelizmente, para consultar o status "approved",
-            // precisamos tentar os tokens até achar (ou salvar o ID no banco na hora da criação).
-            
-            // --- SOLUÇÃO ROBUSTA (CONSULTA EM TODOS OS TOKENS) ---
-            let pagamentoInfo = null;
-            let maquinaAlvo = "";
-            let tempoAlvo = "";
-
-            // Varre a lista de clientes para achar quem recebeu esse pagamento
-            for (const [keyMaq, token] of Object.entries(CLIENTES)) {
-                try {
-                    const client = new MercadoPagoConfig({ accessToken: token });
-                    const payment = new Payment(client);
-                    const dados = await payment.get({ id: id });
-                    
-                    if (dados && dados.status === 'approved') {
-                        pagamentoInfo = dados;
-                        console.log(`Pagamento encontrado na conta da máquina: ${keyMaq}`);
-                        break; // Achou! Para de procurar.
-                    }
-                } catch (e) {
-                    // Ignora erro (significa que o pagamento não é desse token)
+        let pagamentoInfo = null;
+        
+        // Varre os clientes para achar o pagamento
+        // (Nota: Isso pode ser otimizado com banco de dados no futuro)
+        for (const [keyMaq, dados] of Object.entries(CLIENTES)) {
+            try {
+                const client = new MercadoPagoConfig({ accessToken: dados.token_mp });
+                const payment = new Payment(client);
+                const info = await payment.get({ id: id });
+                if (info && info.status === 'approved') {
+                    pagamentoInfo = info;
+                    break;
                 }
-            }
+            } catch (e) {}
+        }
 
-            if (pagamentoInfo) {
-                // Recupera os dados que escondemos no external_reference
-                // Formato: "lavadora01|45"
-                const ref = pagamentoInfo.external_reference.split('|');
-                maquinaAlvo = ref[0];
-                tempoAlvo = ref[1];
-
-                console.log(`LIBERANDO MÁQUINA: ${maquinaAlvo} por ${tempoAlvo} min`);
-
-                // --- COMANDO MQTT ---
-                const topicoComando = `lavanderia/${maquinaAlvo}/comandos`;
-                const mensagem = JSON.stringify({ tempo: tempoAlvo }); // ex: {"tempo": 45} ou {"tempo": "secar"}
-
-                mqttClient.publish(topicoComando, mensagem);
-                console.log(`Comando enviado para ${topicoComando}`);
-            }
-
-        } catch (error) {
-            console.error("Erro no Webhook:", error);
+        if (pagamentoInfo) {
+            const [maquinaAlvo, tempoAlvo] = pagamentoInfo.external_reference.split('|');
+            const mensagem = JSON.stringify({ tempo: tempoAlvo });
+            
+            mqttClient.publish(`lavanderia/${maquinaAlvo}/comandos`, mensagem);
+            console.log(`CICLO INICIADO: ${maquinaAlvo} (${tempoAlvo} min)`);
         }
     }
-
     res.status(200).send("OK");
 });
 
-// Inicia o servidor
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
