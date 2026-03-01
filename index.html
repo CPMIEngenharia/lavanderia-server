@@ -12,11 +12,9 @@
         .card { background: #fff; border-radius: 20px; padding: 25px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); text-align: center; margin-bottom: 20px; }
         .btn-ciclo { width: 100%; padding: 22px; margin: 12px 0; border: none; border-radius: 15px; background-color: var(--azul-claro); color: var(--cor-texto); font-size: 1.1em; font-weight: 900; text-transform: uppercase; cursor: pointer; box-shadow: 0 4px 0px rgba(0,0,0,0.1); }
         .btn-ciclo span { display: block; font-size: 0.75em; margin-top: 5px; font-weight: normal; font-family: sans-serif; text-transform: none; }
-        #area-pix { display: none; border-top: 2px solid var(--azul-fundo); padding-top: 20px; }
-        #qr-code-img { width: 230px; height: 230px; margin: 15px auto; display: block; border: 4px solid var(--azul-claro); border-radius: 10px; }
         .loader { border: 4px solid #f3f3f3; border-top: 4px solid var(--cor-texto); border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; display: none; margin: 20px auto; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .msg-pagamento { font-family: sans-serif; font-size: 0.9em; color: #666; margin-top: 15px; display: none; }
+        .msg-redirecionamento { font-family: sans-serif; font-size: 1em; color: #333; margin-top: 15px; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -26,7 +24,7 @@
 </header>
 
 <div class="container">
-    <div class="card">
+    <div class="card" id="card-principal">
         <span style="display: inline-block; padding: 6px 15px; border-radius: 20px; font-weight: bold; font-size: 0.8em; background: #DFF6E6; color: #218838; margin-bottom: 20px; font-family: sans-serif;">🟢 DISPONÍVEL</span>
         
         <h2 id="titulo-maquina" style="font-family: sans-serif; text-transform: uppercase;">CARREGANDO...</h2>
@@ -34,15 +32,7 @@
         <div id="opcoes-ciclo"></div>
 
         <div id="loader" class="loader"></div>
-    </div>
-
-    <div id="area-pix" class="card">
-        <h3 style="font-family: sans-serif;">PAGAMENTO PIX</h3>
-        <img id="qr-code-img" src="" alt="QR Code">
-        <button onclick="copiarPix()" style="background-color: #f8f9fa; border: 2px dashed var(--azul-claro); color: var(--cor-texto); padding: 15px; width: 100%; border-radius: 10px; font-weight: bold; cursor: pointer; margin-top: 10px; font-family: sans-serif;">
-            📋 COPIAR CÓDIGO PIX
-        </button>
-        <p id="msg-redirecionar" class="msg-pagamento">Aguardando pagamento...</p>
+        <p id="texto-loader" class="msg-redirecionamento" style="display: none;">Gerando pagamento seguro...</p>
     </div>
 </div>
 
@@ -59,7 +49,6 @@
     const tipoMaquina = idMaquina.toLowerCase().includes('secar') ? 'SECADORA' : 'LAVADORA';
     document.getElementById('titulo-maquina').innerText = `${tipoMaquina} ${idMaquina.replace(/[^0-9]/g, "")}`;
 
-    // AQUI ESTÁ A VARIÁVEL QUE DEU ERRO (AGORA ELA SÓ EXISTE UMA VEZ!)
     const opcoesDiv = document.getElementById('opcoes-ciclo');
     
     if (tipoMaquina === 'SECADORA') {
@@ -71,15 +60,15 @@
         `;
     }
 
-    let pixCopiaECola = "";
-
     async function iniciarPagamento(tempo) {
         const loader = document.getElementById('loader');
-        const areaPix = document.getElementById('area-pix');
-        const qrImg = document.getElementById('qr-code-img');
+        const textoLoader = document.getElementById('texto-loader');
+        const botoes = document.getElementById('opcoes-ciclo');
         
+        // Esconde os botões e mostra a bolinha carregando
+        botoes.style.display = 'none';
         loader.style.display = 'block';
-        areaPix.style.display = 'none';
+        textoLoader.style.display = 'block';
 
         try {
             const response = await fetch('/criar_pagamento', {
@@ -90,25 +79,21 @@
 
             const data = await response.json();
 
-            if (data.status === 'ok') {
-                qrImg.src = `data:image/jpeg;base64,${data.qr_base64}`;
-                pixCopiaECola = data.qr_code;
-                areaPix.style.display = 'block';
-                areaPix.scrollIntoView({ behavior: 'smooth' });
+            if (data.status === 'ok' && data.link_pagamento) {
+                textoLoader.innerText = "Redirecionando para o Mercado Pago...";
+                // A MÁGICA ACONTECE AQUI: Redireciona o cliente para a tela de pagamento
+                window.location.href = data.link_pagamento;
             } else {
                 alert("Erro ao iniciar pagamento. Tente novamente.");
+                botoes.style.display = 'block';
+                loader.style.display = 'none';
+                textoLoader.style.display = 'none';
             }
         } catch (e) {
-            alert("Erro de conexão.");
-        } finally {
+            alert("Erro de conexão. Verifique sua internet.");
+            botoes.style.display = 'block';
             loader.style.display = 'none';
-        }
-    }
-
-    function copiarPix() {
-        if (pixCopiaECola) {
-            navigator.clipboard.writeText(pixCopiaECola);
-            alert("Código Pix copiado!");
+            textoLoader.style.display = 'none';
         }
     }
 </script>
